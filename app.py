@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -17,16 +17,10 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tt-hist")
 
 app = Flask(__name__)
-# Allow TickerTruth hosting origins (and localhost for dev)
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    supports_credentials=False,
-)
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
-# Simple in-memory cache: key -> (expires_ts, payload)
 _CACHE: dict = {}
-CACHE_TTL_SEC = 30 * 60  # 30 minutes
+CACHE_TTL_SEC = 30 * 60
 
 
 def _cache_get(key: str):
@@ -52,65 +46,74 @@ def _normalize_ticker(raw: str) -> str:
     return t
 
 
-def _period_to_yfinance(period: str) -> tuple[str, int | None]:
-    """
-    Returns (yfinance_period, max_bars_to_return).
-    Fetch extra history so client EMAs (up to 250) can warm up; trim for display.
-    """
+def _period_settings(period: str) -> tuple[str, int]:
     p = (period or "1y").lower().strip()
-    # display bars approx trading days
+    fetch = {
+        "3mo": "1y",
+        "6mo": "2y",
+        "1y": "2y",
+        "3y": "5y",
+        "5y": "5y",
+    }.get(p, "2y")
     display = {
         "3mo": 70,
         "6mo": 140,
         "1y": 270,
         "3y": 800,
-        "5y": 1400,
+        "5y": 1300,
     }.get(p, 270)
-    # yfinance allowed periods — use longer fetch for EMA warmup
-    fetch = {
-        "3mo": "2y",
-        "6mo": "2y",
-        "1y": "5y",
-        "3y": "5y",
-        "5y": "max",
-    }.get(p, "5y")
     return fetch, display
 
 
 def fetch_ohlc(ticker: str, period: str) -> dict:
-    yf_period, max_bars = _period_to_yfinance(period)
+    yf_period, max_bars = _period_settings(period)
     cache_key = f"{ticker}|{yf_period}|{max_bars}"
     cached = _cache_get(cache_key)
     if cached:
         log.info("cache hit %s", cache_key)
         return cached
 
-    log.info("yfinance download %s period=%s", ticker, yf_period)
-    df = yf.download(
-        ticker,
-        period=yf_period,
-        interval="1d",
-        progress=False,
-        auto_adjust=True,
-        threads=False,
-    )
+    log.info("yfinance history %s period=%s", ticker, yf_period)
+    t0 = time.time()
+
+    stock = yf.Ticker(ticker)
+    df = stock.history(period=yf_period, interval="1d", auto_adjust=True, actions=False)
+
+    if df is None or df.empty:
+        log.warning("Ticker.history empty, retry download()")
+        df = yf.download(
+            ticker,
+            period=yf_period,
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+            threads=False,
+        )
+
     if df is None or df.empty:
         raise LookupError(f"No data for ticker '{ticker}'")
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    need = ["Open", "High", "Low", "Close"]
-    for col in need:
+    cols = {c: str(c).strip().title() for c in df.columns}
+    df = df.rename(columns=cols)
+
+    for col in ("Open", "High", "Low", "Close"):
         if col not in df.columns:
             raise LookupError(f"Missing column {col} for {ticker}")
 
-    df = df[need].dropna()
+    df = df[["Open", "High", "Low", "Close"]].dropna()
     df.index = pd.to_datetime(df.index)
+    try:
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_localize(None)
+    except Exception:
+        pass
     df = df.sort_index()
 
     if len(df) < 15:
-        raise LookupError(f"Not enough history for {ticker}")
+        raise LookupError(f"Not enough history for {ticker} ({len(df)} bars)")
 
     if max_bars and len(df) > max_bars:
         df = df.iloc[-max_bars:]
@@ -126,8 +129,10 @@ def fetch_ohlc(ticker: str, period: str) -> dict:
         "closes": [round(float(x), 4) for x in df["Close"].tolist()],
         "count": len(dates),
         "source": "yfinance",
+        "elapsed_ms": int((time.time() - t0) * 1000),
     }
     _cache_set(cache_key, payload)
+    log.info("ok %s bars=%s in %sms", ticker, payload["count"], payload["elapsed_ms"])
     return payload
 
 
@@ -157,7 +162,7 @@ def history():
         ticker = _normalize_ticker(request.args.get("ticker", ""))
         period = (request.args.get("period") or "1y").lower().strip()
         if period not in {"3mo", "6mo", "1y", "3y", "5y"}:
-            return jsonify({"error": "Invalid period"}), 400
+            return jsonify({"error": "Invalid period. Use 3mo,6mo,1y,3y,5y"}), 400
         data = fetch_ohlc(ticker, period)
         return jsonify(data)
     except ValueError as e:
@@ -166,7 +171,7 @@ def history():
         return jsonify({"error": str(e)}), 404
     except Exception as e:
         log.exception("history failed")
-        return jsonify({"error": f"Server error: {e}"}), 500
+        return jsonify({"error": f"Server error: {type(e).__name__}: {e}"}), 500
 
 
 if __name__ == "__main__":
